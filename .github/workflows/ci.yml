@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [18, 20, 22]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Syntax check all modules
+        run: |
+          set -e
+          for f in src/*.mjs src/**/*.mjs; do
+            echo -n "$f: "
+            node --check "$f" 2>&1 && echo "OK" || exit 1
+          done
+
+      - name: Verify no hardcoded API keys
+        run: |
+          ! grep -rn 'api_key.*sk-\|api_key.*key-' src/ web/ || (
+            echo "ERROR: Hardcoded API keys detected" && exit 1
+          )
+
+      - name: Verify config.example.json is valid JSON
+        run: node -e "JSON.parse(require('fs').readFileSync('config.example.json','utf8'))"
+
+      - name: Verify HTML references exist
+        run: |
+          node -e "
+          const fs = require('fs');
+          const html = fs.readFileSync('web/index.html', 'utf8');
+          const cssMatch = html.match(/href=\"([^\"]+\.css)\"/);
+          const jsMatch = html.match(/src=\"([^\"]+\.mjs)\"/);
+          if (cssMatch && !fs.existsSync('web/' + cssMatch[1])) { console.error('Missing: ' + cssMatch[1]); process.exit(1); }
+          if (jsMatch && !fs.existsSync('web/' + jsMatch[1])) { console.error('Missing: ' + jsMatch[1]); process.exit(1); }
+          console.log('HTML asset references OK');
+          "
