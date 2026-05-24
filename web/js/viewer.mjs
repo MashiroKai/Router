@@ -1408,8 +1408,7 @@ async function loadSSEEvents(el, requestId, date) {
   }
   el.innerHTML = '&#9660; SSE 事件流（加载中...）';
   try {
-    const resp = await apiFetch(`/sse-events?date=${encodeURIComponent(date)}&request_id=${encodeURIComponent(requestId)}`);
-    const data = await resp.json();
+    const data = await apiFetch(`/sse-events?date=${encodeURIComponent(date)}&request_id=${encodeURIComponent(requestId)}`);
     const events = data.events || [];
     if (events.length === 0) {
       area.textContent = '无 SSE 事件记录';
