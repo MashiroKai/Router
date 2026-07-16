@@ -1,15 +1,25 @@
 /**
- * Viewer API — REST endpoints for the web dashboard.
+ * Nebflow LLM Log Reader — pure viewer server.
+ *
+ * Reads JSONL logs produced by Nebflow's LlmLogWriter at
+ * ~/.nebflow/logs/router/ and serves them via a web dashboard.
+ *
+ * No proxy, no LLM calls, no multi-agent. Just reads.
  */
 
+import http from 'http';
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
 
-import { CONFIG, AGENT_MODELS_PATH, getAgentModels, saveAgentModels } from '../config.mjs';
-import { getLogFilePath, getObject } from '../logging/logger.mjs';
-import { getCircuitStates } from '../provider/circuit.mjs';
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const WEB_ROOT = path.join(__dirname, '..', 'web');
+const LOG_DIR = path.join(process.env.HOME, '.nebflow', 'logs', 'router');
+const OBJECTS_DIR = path.join(LOG_DIR, 'objects');
+const PORT = parseInt(process.env.PORT || '9997', 10);
+const RETENTION_DAYS = 3;
 
-// ── Helpers ─────────────────────────────────────────────────────────
+// ── Helpers ──────────────────────────────────────────────────────────
 
 function sendJSON(res, data, statusCode = 200) {
   res.writeHead(statusCode, { 'Content-Type': 'application/json; charset=utf-8' });
@@ -23,100 +33,48 @@ function sendError(res, message, statusCode = 400) {
 function readJsonlLines(filepath) {
   try {
     const content = fs.readFileSync(filepath, 'utf-8');
-    return content.trim().split('\n').filter(Boolean).map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+    return content.trim().split('\n').filter(Boolean).map(l => {
+      try { return JSON.parse(l); } catch { return null; }
+    }).filter(Boolean);
   } catch { return []; }
+}
+
+function getLogFilePath(suffix, date) {
+  const d = date || new Date().toISOString().slice(0, 10);
+  return path.join(LOG_DIR, `${d}_${suffix}.jsonl`);
+}
+
+function getObject(hash) {
+  try { return JSON.parse(fs.readFileSync(path.join(OBJECTS_DIR, hash + '.json'), 'utf-8')); }
+  catch { return null; }
 }
 
 function getAvailableDates() {
   try {
-    const files = fs.readdirSync(path.dirname(getLogFilePath('summary')));
+    const files = fs.readdirSync(LOG_DIR);
     const dates = new Set();
-    for (const f of files) { const m = f.match(/^(\d{4}-\d{2}-\d{2})_summary\.jsonl$/); if (m) dates.add(m[1]); }
+    for (const f of files) {
+      const m = f.match(/^(\d{4}-\d{2}-\d{2})_summary\.jsonl$/);
+      if (m) dates.add(m[1]);
+    }
     return [...dates].sort().reverse();
   } catch { return []; }
 }
 
-// ── API Handlers ────────────────────────────────────────────────────
+// ── API: Dates ───────────────────────────────────────────────────────
 
 function handleDates(_req, res) {
   return sendJSON(res, { dates: getAvailableDates() });
 }
 
-function handleAgentsModels(req, res) {
-  if (req.method === 'GET') {
-    const availableModels = new Set();
-    for (const p of CONFIG.providers) {
-      if (p.models?.default) availableModels.add(p.models.default);
-      for (const m of Object.values(p.models?.anthropic_mapping || {})) availableModels.add(m);
-    }
-    const today = new Date().toISOString().slice(0, 10);
-    const todayEntries = readJsonlLines(getLogFilePath('summary', today));
-    const discovered = [...new Set(todayEntries.filter(e => e.type === 'request').map(e => e.agent || 'unknown'))];
-    const cfg = getAgentModels();
-    const agents = {};
-    const knownAgents = ['claude-code', 'nebflow', 'openclaw', 'codex'];
-    for (const a of [...new Set([...knownAgents, ...discovered])]) {
-      agents[a] = { model: cfg[a] || null };
-    }
-    return sendJSON(res, { agents, available_models: [...availableModels], discovered_agents: discovered });
-  }
-
-  if (req.method === 'POST') {
-    let body = '';
-    req.on('data', chunk => body += chunk);
-    req.on('end', () => {
-      try {
-        const { agent, model } = JSON.parse(body);
-        if (!agent) return sendJSON(res, { error: 'agent is required' }, 400);
-        const cfg = getAgentModels();
-        cfg[agent] = model || null;
-        saveAgentModels(cfg);
-        console.log(`[MODEL] Agent "${agent}" model set to: ${model || 'default'}`);
-        return sendJSON(res, { agent, model: cfg[agent] });
-      } catch {
-        return sendJSON(res, { error: 'invalid JSON' }, 400);
-      }
-    });
-    return;
-  }
-}
-
-function handleModel(req, res) {
-  if (req.method === 'GET') {
-    const providers = CONFIG.providers.map(p => ({
-      id: p.id, name: p.name, default: p.models?.default || '',
-    }));
-    const cfg = getAgentModels();
-    const current = Object.values(cfg).find(v => v && v !== 'auto') || CONFIG.providers[0]?.models?.default || '';
-    return sendJSON(res, { current, isOverride: !!current, providers });
-  }
-  if (req.method === 'POST') {
-    let body = '';
-    req.on('data', chunk => body += chunk);
-    req.on('end', () => {
-      try {
-        const { model } = JSON.parse(body);
-        if (!model) return sendJSON(res, { error: 'model is required' }, 400);
-        const cfg = getAgentModels();
-        for (const known of ['claude-code', 'nebflow', 'openclaw', 'codex']) {
-          if (!cfg[known]) cfg[known] = model;
-        }
-        saveAgentModels(cfg);
-        console.log(`[MODEL] Global model changed to: ${model}`);
-        return sendJSON(res, { current: model, isOverride: true });
-      } catch {
-        return sendJSON(res, { error: 'invalid JSON' }, 400);
-      }
-    });
-    return;
-  }
-}
+// ── API: Logs (paired request+response list) ─────────────────────────
 
 function handleLogs(_req, res, query) {
   const date = query.get('date') || new Date().toISOString().slice(0, 10);
   const entries = readJsonlLines(getLogFilePath('summary', date));
   const sseEntries = readJsonlLines(getLogFilePath('sse', date));
 
+  // Build SSE usage lookup by request_id and by agent
   const sseByRid = {};
   const sseByAgent = {};
   for (const sse of sseEntries) {
@@ -125,7 +83,7 @@ function handleLogs(_req, res, query) {
       sseByRid[sse.request_id] = sseByRid[sse.request_id] || [];
       sseByRid[sse.request_id].push({ ts: new Date(sse.timestamp).getTime(), usage: sse.usage });
     }
-    const a = sse.agent || 'router';
+    const a = sse.agent || 'nebflow';
     sseByAgent[a] = sseByAgent[a] || [];
     sseByAgent[a].push({ ts: new Date(sse.timestamp).getTime(), usage: sse.usage });
   }
@@ -140,7 +98,7 @@ function handleLogs(_req, res, query) {
     let respTime = null;
     for (let j = i + 1; j < entries.length; j++) {
       const next = entries[j];
-      if (next.type === 'response' && (next.agent || 'router') === (e.agent || 'router')) {
+      if (next.type === 'response' && (next.agent || 'nebflow') === (e.agent || 'nebflow')) {
         item.response_status = next.status_code;
         item.response_time_ms = new Date(next.timestamp) - new Date(e.timestamp);
         respTime = new Date(next.timestamp).getTime();
@@ -165,7 +123,7 @@ function handleLogs(_req, res, query) {
       if (rid && sseByRid[rid]) {
         for (const sse of sseByRid[rid]) mergeOne(sse.usage);
       } else {
-        const agentKey = e.agent || 'router';
+        const agentKey = e.agent || 'nebflow';
         const agentSse = sseByAgent[agentKey] || [];
         const reqTime = new Date(e.timestamp).getTime();
         const boundTime = respTime || reqTime + 300000;
@@ -180,6 +138,8 @@ function handleLogs(_req, res, query) {
   return sendJSON(res, { date, entries: paired });
 }
 
+// ── API: Detail (full request+response with object resolution) ───────
+
 function handleDetail(_req, res, query) {
   const date = query.get('date');
   const index = parseInt(query.get('index') || '0', 10);
@@ -193,6 +153,8 @@ function handleDetail(_req, res, query) {
   if (targetIdx === -1) return sendError(res, 'Entry not found', 404);
 
   const requestEntry = entries[targetIdx];
+
+  // Resolve object refs
   if (requestEntry.message_refs && !requestEntry.full) {
     requestEntry.full = {
       system: requestEntry.system_ref ? getObject(requestEntry.system_ref) : undefined,
@@ -204,12 +166,14 @@ function handleDetail(_req, res, query) {
     };
   }
 
+  // Find response entry
   let responseEntry = null;
   for (let i = targetIdx + 1; i < entries.length; i++) {
     if (entries[i].type === 'response' && entries[i].agent === requestEntry.agent) { responseEntry = entries[i]; break; }
     if (entries[i].type === 'request') break;
   }
 
+  // Reconstruct streaming response from SSE events
   if (responseEntry?.is_streaming) {
     const sseEntries = readJsonlLines(getLogFilePath('sse', date));
     const rid = requestEntry.request_id;
@@ -253,6 +217,7 @@ function handleDetail(_req, res, query) {
     if (toolCalls.length > 0) responseEntry.reconstructed_tool_calls = toolCalls;
   }
 
+  // Fallback: try to find assistant message in next request
   if (!responseEntry?.reconstructed_content && responseEntry?.status_code === 200 && responseEntry?.is_streaming) {
     const currentMsgsCount = requestEntry.full?.messages?.length || requestEntry.message_refs?.length || 0;
     for (let i = targetIdx + 1; i < entries.length; i++) {
@@ -293,6 +258,8 @@ function handleDetail(_req, res, query) {
   return sendJSON(res, { request: requestEntry, response: responseEntry });
 }
 
+// ── API: SSE Events ──────────────────────────────────────────────────
+
 function handleSSEEvents(_req, res, query) {
   const date = query.get('date');
   const requestId = query.get('request_id');
@@ -302,13 +269,15 @@ function handleSSEEvents(_req, res, query) {
   return sendJSON(res, { events });
 }
 
+// ── API: Usage ───────────────────────────────────────────────────────
+
 function handleUsage(_req, res, query) {
   const date = query.get('date') || new Date().toISOString().slice(0, 10);
   const sseEntries = readJsonlLines(getLogFilePath('sse', date));
   const byAgent = {};
   for (const sse of sseEntries) {
     if (!sse.usage) continue;
-    const a = sse.agent || 'router';
+    const a = sse.agent || 'nebflow';
     if (!byAgent[a]) byAgent[a] = { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, request_count: 0 };
     const u = sse.usage;
     byAgent[a].input_tokens += u.input_tokens || u.prompt_tokens || 0;
@@ -328,45 +297,7 @@ function handleUsage(_req, res, query) {
   return sendJSON(res, { date, total, byAgent });
 }
 
-function handleProviderUsage(_req, res, query) {
-  const date = query.get('date') || new Date().toISOString().slice(0, 10);
-  const modelToProvider = {};
-  for (const p of CONFIG.providers || []) {
-    const pid = p.id;
-    if (p.models?.default) modelToProvider[p.models.default] = pid;
-    if (p.models?.anthropic_mapping) {
-      for (const v of Object.values(p.models.anthropic_mapping)) {
-        modelToProvider[v] = pid;
-      }
-    }
-  }
-  const summaryEntries = readJsonlLines(getLogFilePath('summary', date));
-  const responseEntries = summaryEntries.filter(e => e.type === 'response' && e.usage);
-  const byProvider = {};
-  for (const e of responseEntries) {
-    let pid = e.provider_id || null;
-    if (!pid) {
-      const model = e.resolved_model || e.request_model || '';
-      pid = modelToProvider[model] || 'unknown';
-    }
-    if (!byProvider[pid]) byProvider[pid] = { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, request_count: 0 };
-    const u = e.usage;
-    byProvider[pid].input_tokens += u.input_tokens || u.prompt_tokens || 0;
-    byProvider[pid].output_tokens += u.output_tokens || u.completion_tokens || 0;
-    byProvider[pid].cache_read_input_tokens += u.cache_read_input_tokens || 0;
-    byProvider[pid].cache_creation_input_tokens += u.cache_creation_input_tokens || 0;
-    byProvider[pid].request_count += 1;
-  }
-  const total = { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, request_count: 0 };
-  for (const v of Object.values(byProvider)) {
-    total.input_tokens += v.input_tokens;
-    total.output_tokens += v.output_tokens;
-    total.cache_read_input_tokens += v.cache_read_input_tokens;
-    total.cache_creation_input_tokens += v.cache_creation_input_tokens;
-    total.request_count += v.request_count;
-  }
-  return sendJSON(res, { date, total, byProvider });
-}
+// ── API: Stats ───────────────────────────────────────────────────────
 
 function handleStats(_req, res) {
   const dates = getAvailableDates();
@@ -375,87 +306,125 @@ function handleStats(_req, res) {
     const entries = readJsonlLines(getLogFilePath('summary', date));
     const requests = entries.filter(e => e.type === 'request');
     const byAgent = {};
-    for (const r of requests) { const a = r.agent || 'router'; byAgent[a] = (byAgent[a] || 0) + 1; }
+    for (const r of requests) { const a = r.agent || 'nebflow'; byAgent[a] = (byAgent[a] || 0) + 1; }
     stats[date] = { total: requests.length, byAgent };
   }
   return sendJSON(res, { stats });
 }
 
-function handleCircuitStates(_req, res) {
-  const states = getCircuitStates();
-  const providers = CONFIG.providers.map(p => ({
-    id: p.id,
-    name: p.name,
-    models: p.models,
-    circuit: states[p.id] || null,
-  }));
-  return sendJSON(res, { providers });
-}
+// ── Static File Serving ──────────────────────────────────────────────
 
-// ── Router ──────────────────────────────────────────────────────────
+const MIME = {
+  '.html': 'text/html; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.js': 'application/javascript; charset=utf-8',
+  '.mjs': 'application/javascript; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.png': 'image/png',
+  '.svg': 'image/svg+xml',
+};
 
-const VIEWER_HTML_PATH = path.join(process.env.HOME, 'Router', 'web', 'index.html');
-
-export function handleViewerRequest(req, res) {
-  const parsedUrl = new URL(req.url, `http://${req.headers.host}`);
-  const pathname = parsedUrl.pathname;
-  const query = parsedUrl.searchParams;
-
-  // Exact match for root viewer URL — must be before the generic startsWith
-  if (pathname === '/_viewer' || pathname === '/_viewer/') {
-    return serveStaticFile(req, res, '/_viewer/index.html');
-  }
-
-  if (pathname.startsWith('/_viewer/api/')) {
-    res.setHeader('Access-Control-Allow-Origin', '*');
-
-    // Route to handler
-    if (pathname === '/_viewer/api/dates') return handleDates(req, res);
-    if (pathname === '/_viewer/api/agents/models') return handleAgentsModels(req, res);
-    if (pathname === '/_viewer/api/model') return handleModel(req, res);
-    if (pathname === '/_viewer/api/logs') return handleLogs(req, res, query);
-    if (pathname === '/_viewer/api/detail') return handleDetail(req, res, query);
-    if (pathname === '/_viewer/api/sse-events') return handleSSEEvents(req, res, query);
-    if (pathname === '/_viewer/api/usage') return handleUsage(req, res, query);
-    if (pathname === '/_viewer/api/provider-usage') return handleProviderUsage(req, res, query);
-    if (pathname === '/_viewer/api/stats') return handleStats(req, res);
-    if (pathname === '/_viewer/api/circuit-states') return handleCircuitStates(req, res);
-
-    return sendError(res, 'Unknown API endpoint', 404);
-  }
-
-  // Serve static files from web/
-  if (pathname.startsWith('/_viewer/')) {
-    return serveStaticFile(req, res, pathname);
-  }
-
-  sendError(res, 'Not found', 404);
-}
-
-function serveStaticFile(req, res, pathname) {
-  // Map /_viewer/* to web/*
+function serveStaticFile(res, pathname) {
   const relPath = pathname.slice('/_viewer/'.length);
-  const safePath = path.normalize(relPath).replace(/^\.\./, ''); // prevent traversal
-  const filePath = path.join(process.env.HOME, 'Router', 'web', safePath);
-
-  const extMap = {
-    '.html': 'text/html; charset=utf-8',
-    '.css': 'text/css; charset=utf-8',
-    '.js': 'application/javascript; charset=utf-8',
-    '.mjs': 'application/javascript; charset=utf-8',
-    '.json': 'application/json; charset=utf-8',
-    '.png': 'image/png',
-    '.svg': 'image/svg+xml',
-  };
-
+  const filePath = path.resolve(WEB_ROOT, relPath);
+  const rootWithSep = WEB_ROOT + path.sep;
+  if (filePath !== WEB_ROOT && !filePath.startsWith(rootWithSep)) {
+    res.writeHead(403); res.end('Forbidden'); return;
+  }
   try {
     const content = fs.readFileSync(filePath);
-    const ext = path.extname(filePath);
-    const contentType = extMap[ext] || 'application/octet-stream';
-    res.writeHead(200, { 'Content-Type': contentType });
+    const ct = MIME[path.extname(filePath)] || 'application/octet-stream';
+    res.writeHead(200, { 'Content-Type': ct });
     res.end(content);
   } catch {
     res.writeHead(404, { 'Content-Type': 'text/plain' });
     res.end('Not found: ' + pathname);
   }
 }
+
+// ── Retention: hard 3-day limit ──────────────────────────────────────
+
+function pruneOldLogs() {
+  try {
+    const cutoff = new Date(Date.now() - RETENTION_DAYS * 86400_000).toISOString().slice(0, 10);
+    const usedHashes = new Set();
+
+    if (fs.existsSync(LOG_DIR)) {
+      for (const f of fs.readdirSync(LOG_DIR)) {
+        if (!f.endsWith('.jsonl')) continue;
+        const dateStr = f.slice(0, 10);
+        const fullPath = path.join(LOG_DIR, f);
+        if (dateStr < cutoff) {
+          fs.unlinkSync(fullPath);
+        } else {
+          // Collect referenced hashes
+          for (const line of fs.readFileSync(fullPath, 'utf-8').split('\n')) {
+            if (!line.trim()) continue;
+            try {
+              const entry = JSON.parse(line);
+              if (entry.system_ref) usedHashes.add(entry.system_ref);
+              if (entry.tools_ref) usedHashes.add(entry.tools_ref);
+              if (Array.isArray(entry.message_refs)) for (const h of entry.message_refs) usedHashes.add(h);
+            } catch {}
+          }
+        }
+      }
+    }
+
+    // Delete orphaned objects
+    if (fs.existsSync(OBJECTS_DIR)) {
+      for (const f of fs.readdirSync(OBJECTS_DIR)) {
+        if (!f.endsWith('.json')) continue;
+        const hash = f.slice(0, -5);
+        if (!usedHashes.has(hash)) fs.unlinkSync(path.join(OBJECTS_DIR, f));
+      }
+    }
+  } catch (e) {
+    console.error('[Retention] Error:', e.message);
+  }
+}
+
+// ── Request Router ───────────────────────────────────────────────────
+
+const server = http.createServer((req, res) => {
+  const parsedUrl = new URL(req.url, `http://${req.headers.host}`);
+  const pathname = parsedUrl.pathname;
+  const query = parsedUrl.searchParams;
+
+  // Root → redirect to viewer
+  if (pathname === '/' || pathname === '/_viewer' || pathname === '/_viewer/') {
+    parsedUrl.pathname = '/_viewer/index.html';
+    return serveStaticFile(res, '/_viewer/index.html');
+  }
+
+  // API endpoints
+  if (pathname.startsWith('/_viewer/api/')) {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
+
+    if (pathname === '/_viewer/api/dates') return handleDates(req, res);
+    if (pathname === '/_viewer/api/logs') return handleLogs(req, res, query);
+    if (pathname === '/_viewer/api/detail') return handleDetail(req, res, query);
+    if (pathname === '/_viewer/api/sse-events') return handleSSEEvents(req, res, query);
+    if (pathname === '/_viewer/api/usage') return handleUsage(req, res, query);
+    if (pathname === '/_viewer/api/stats') return handleStats(req, res);
+
+    return sendError(res, 'Unknown API endpoint', 404);
+  }
+
+  // Static files
+  if (pathname.startsWith('/_viewer/')) {
+    return serveStaticFile(res, pathname);
+  }
+
+  sendError(res, 'Not found', 404);
+});
+
+server.listen(PORT, () => {
+  console.log(`Nebflow LLM Log Reader → http://127.0.0.1:${PORT}/`);
+  console.log(`  Log source: ${LOG_DIR}`);
+  pruneOldLogs();
+  setInterval(pruneOldLogs, 3600_000); // hourly
+});

@@ -1,7 +1,4 @@
 # Runtime
-config.json
-agent_models.json
-logs/
 .pids
 
 # OS

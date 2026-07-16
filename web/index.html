@@ -3,30 +3,28 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Router</title>
-<link rel="stylesheet" href="css/viewer.css">
+<title>Nebflow Log Reader</title>
+<link rel="stylesheet" href="/_viewer/css/viewer.css">
 </head>
 <body>
 <div class="app">
-  <div class="sidebar">
-    <div class="sidebar-header">
-      <h1 id="mainTitle">Router</h1>
-      <select class="date-selector" id="dateSelector"></select>
-      <div class="model-selector-wrap">
-        <label>Agent Models</label>
-        <div class="agent-model-list" id="agentModelList"></div>
-        <div class="model-indicator" id="modelIndicator"></div>
-      </div>
-      <div class="provider-usage-section" id="providerUsageSection">
-        <div class="pu-title">Provider Token Usage</div>
-        <div id="providerUsageContent"></div>
-      </div>
+  <!-- ActivityBar — agent icons dynamically rendered by JS -->
+  <nav class="activity-bar">
+    <div class="activity-bar-top" id="agentBar"></div>
+  </nav>
+
+  <!-- Sidebar — sessions for selected agent, or settings -->
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-tab active" data-panel="sessions">
+      <div class="stitle" id="sessionsTitle">Sessions</div>
+      <div class="sbar"><select id="dateSelector" class="date-select"></select></div>
+      <div class="slist" id="sessionList"></div>
+      <div class="sfooter" id="statsBar"></div>
     </div>
-    <div class="agent-filters" id="agentFilters"></div>
-    <div class="request-list" id="requestList"></div>
-    <div class="stats-bar" id="statsBar"></div>
-  </div>
-  <div class="main-panel">
+  </aside>
+
+  <!-- Main Panel -->
+  <main class="main-panel">
     <div class="detail-header" id="detailHeader" style="display:none"></div>
     <div class="token-bar" id="tokenBar" style="display:none"></div>
     <div class="ctx-bar" id="ctxBar">
@@ -35,61 +33,23 @@
       <span class="ctx-numbers"><span id="ctxPct" class="ctx-pct"></span> <span id="ctxDetail"></span></span>
     </div>
     <div class="tk-help-panel" id="helpPanel">
-      <h4>Token 计算原理 (Anthropic 格式)</h4>
-      <div class="help-section" style="border-left-color:var(--accent-blue)">
-        <h5 style="color:var(--accent-blue)">Input（输入 token）</h5>
-        <p>你发送给模型的全部内容都算 input token，包括：</p>
-        <ul style="padding-left:16px">
-          <li><b>System prompt</b> — 系统指令、工具定义、项目上下文（Anthropic 顶层 system 字段）</li>
-          <li><b>历史对话</b> — 之前的 user/assistant/tool 消息（每轮请求都会重新发送完整历史）</li>
-          <li><b>当前用户输入</b> — 你这次实际输入的内容</li>
-        </ul>
-        <p>API 返回 <code>input_tokens</code> = 总输入数，其中 <code>cache_read_input_tokens</code> 被缓存读取，<code>cache_creation_input_tokens</code> 被缓存写入。<br>显示的 Input = <code>input_tokens − cache_read − cache_write</code>（需要实际传输的部分）</p>
-      </div>
-      <div class="help-section" style="border-left-color:var(--accent-yellow)">
-        <h5 style="color:var(--accent-yellow)">Cache Read / Cache Write（缓存 token）</h5>
-        <p>API 提供商（智谱 Anthropic 兼容端点）支持 Prompt Cache：</p>
-        <ul style="padding-left:16px">
-          <li><b>Cache Read</b> — 命中已有缓存的 token，无需重新计算，成本更低</li>
-          <li><b>Cache Write</b> — 首次写入缓存的 token，在后续请求中可被命中</li>
-        </ul>
-        <p>点击 <b>Cache Read</b> 标签 → 高亮 system 和 assistant 历史消息（这些是缓存命中的主要来源）</p>
-      </div>
-      <div class="help-section" style="border-left-color:var(--accent-green)">
-        <h5 style="color:var(--accent-green)">Output（输出 token）</h5>
-        <p>模型返回的全部 token，API 返回 <code>output_tokens</code>。包括文本输出和 tool_use 调用。</p>
-        <p>Thinking（思考）内容在 content blocks 中以 <code>thinking</code> 类型返回，不是单独的 reasoning token 计数。</p>
-      </div>
-      <div class="help-section" style="border-left-color:var(--accent-orange)">
-        <h5 style="color:var(--accent-orange)">Thinking（思考内容）</h5>
-        <p>启用思考模式的模型会先进行内部推理，再给出回答。思考过程以 <code>thinking</code> content block 形式返回。</p>
-        <p>点击 OUTPUT 面板中的 Thinking 区域可展开查看完整思考内容。</p>
-      </div>
-      <div class="help-section" style="border-left-color:var(--text-muted)">
-        <h5>数据来源</h5>
-        <p>所有数字来自 API 响应的 <code>usage</code> 字段，不是客户端计算的。token 计数由服务端在处理请求时统计。</p>
-      </div>
-      <div class="help-section" style="border-left-color:var(--accent-blue)">
-        <h5 style="color:var(--accent-blue)">Context Window（上下文窗口）</h5>
-        <p>每个模型有一个固定的上下文窗口大小（如 GLM-5.1 = 204,800 tokens）。这是单次请求能处理的最大 token 数量（输入 + 输出之和的上限）。</p>
-        <p>进度条显示的是 <code>input_tokens / context_window</code>，即输入占上下文窗口的比例。</p>
-        <ul style="padding-left:16px">
-          <li><span style="color:var(--accent-green)">绿色</span> — 使用量 &lt; 70%，安全</li>
-          <li><span style="color:var(--accent-yellow)">黄色</span> — 使用量 70%–90%，注意</li>
-          <li><span style="color:var(--accent-red)">红色</span> — 使用量 &gt; 90%，接近上限</li>
-        </ul>
-        <p>当上下文接近满时，模型可能截断输入或拒绝请求。长对话中 messages 不断累积是主要原因。</p>
-      </div>
+      <h4>Token Usage</h4>
+      <div class="help-section"><h5>Input</h5><p>Total tokens sent to the model. Displayed as <code>input - cache_read - cache_write</code> — the actual amount that needs transmission.</p></div>
+      <div class="help-section"><h5>Cache Read / Write</h5><p><b>Read</b> — tokens served from prompt cache (faster, cheaper). <b>Write</b> — first-time cache population for future requests.</p></div>
+      <div class="help-section"><h5>Output</h5><p>All tokens returned by the model, including text and tool_use blocks.</p></div>
+      <div class="help-section"><h5>Context Window</h5><p>Progress bar shows <code>input_tokens / context_window</code>. Green &lt; 70%, Yellow &lt; 90%, Red &gt; 90%.</p></div>
     </div>
     <div class="io-tabs" id="ioTabs" style="display:none">
-      <div class="io-tab tab-in active" data-tab="input" onclick="switchTab('input')">INPUT <span class="tab-badge" id="inputBadge">0 msgs</span></div>
-      <div class="io-tab tab-out" data-tab="output" onclick="switchTab('output')">OUTPUT <span class="tab-badge" id="outputBadge">stream</span></div>
-      <div class="io-tab tab-diff" data-tab="diff" onclick="switchTab('diff')">DIFF <span class="tab-badge" id="diffBadge">—</span></div>
+      <div class="io-tab active" data-tab="input" onclick="switchTab('input')">INPUT <span class="tab-badge" id="inputBadge">0 msgs</span></div>
+      <div class="io-tab" data-tab="output" onclick="switchTab('output')">OUTPUT <span class="tab-badge" id="outputBadge">stream</span></div>
+      <div class="io-tab" data-tab="diff" onclick="switchTab('diff')">DIFF <span class="tab-badge" id="diffBadge">—</span></div>
     </div>
     <div class="messages-area" id="messagesArea">
       <div class="empty-state">Select a request to view details</div>
+      <div class="empty-state secondary" id="outputEmpty" style="display:none"></div>
     </div>
-  </div>
+  </main>
 </div>
-
-<script src="js/viewer.mjs"></script>
+<script src="/_viewer/js/viewer.mjs"></script>
+</body>
+</html>
